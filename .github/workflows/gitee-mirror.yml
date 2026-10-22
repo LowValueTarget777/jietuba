@@ -1,0 +1,82 @@
+name: Gitee release mirror
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只读预演，不上传或删除 Gitee 附件"
+        type: boolean
+        required: true
+        default: true
+  push:
+    paths:
+      - ".github/workflows/gitee-mirror.yml"
+      - "scripts/mirror_gitee.py"
+      - "scripts/test_mirror_gitee.py"
+      - "docs/gitee-mirror.md"
+  pull_request:
+    paths:
+      - ".github/workflows/gitee-mirror.yml"
+      - "scripts/mirror_gitee.py"
+      - "scripts/test_mirror_gitee.py"
+      - "docs/gitee-mirror.md"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Test release scripts without credentials
+        run: python -m unittest discover -s scripts -p 'test_*.py'
+
+  sync:
+    needs: test
+    # 手动选择其他分支时也不传入密钥；定时任务只处理默认分支的受信任代码。
+    if: >-
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      vars.GITEE_REPOSITORY != '' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.dry_run) ||
+       vars.GITEE_MIRROR_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: gitee-release-mirror
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # 固定本次触发的提交，与前置测试保持一致，避免分支在排队期间推进。
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Mirror the latest stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPOSITORY: ${{ vars.GITEE_REPOSITORY }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        shell: bash
+        run: |
+          args=(--target-repo "$GITEE_REPOSITORY")
+          if [[ "$DRY_RUN" != "true" ]]; then
+            args+=(--apply)
+          fi
+          python scripts/mirror_gitee.py "${args[@]}"
