@@ -1,18 +1,19 @@
 """Mirror verified public Jietuba releases to Gitee; preview unless --apply is set."""
 
 import argparse
+import contextlib
 import hashlib
 import http.client
 import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 
 SOURCE = "1003129155/jietuba"
@@ -21,6 +22,10 @@ FILE_LIMIT = 100_000_000
 JSON_LIMIT = 4_000_000
 CHECKSUM_LIMIT = 64_000
 TAG_PATTERN = r"release-([0-9]+)\.([0-9]+)\.([0-9]+)"
+
+
+def log(message):
+    print(message, flush=True)
 
 
 class MirrorError(Exception):
@@ -69,6 +74,81 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 class Client:
     def __init__(self):
         self.opener = urllib.request.build_opener(SafeRedirect())
+
+    def transfer(self, url, dest, size, upload=None):
+        """大文件交给 curl 流式传输，总时限覆盖连接、发送和接收全过程。"""
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password:
+            raise MirrorError("传输地址必须为无凭据的 HTTPS 地址")
+        if upload is not None and parsed.hostname != "gitee.com":
+            raise MirrorError("只允许向 Gitee 上传附件")
+        curl = shutil.which("curl.exe" if os.name == "nt" else "curl")
+        if not curl:
+            raise MirrorError("未找到 curl，请安装后重试")
+        limit = 900 if upload is not None else 300
+        label = ("上传 " + upload.name) if upload is not None else ("下载 " + dest.name)
+        args = [curl, "--disable", "--proto", "=https", "--proto-redir", "=https",
+                "--connect-timeout", "15", "--max-time", str(limit),
+                "--speed-limit", "1024", "--speed-time", "60", "--progress-bar",
+                "--max-filesize", str(JSON_LIMIT if upload is not None else size),
+                "--user-agent", "jietuba-release-mirror", "--output", str(dest),
+                "--write-out", "%{http_code}", "--config", "-"]
+        config = ""
+        if upload is None:
+            args += ["--location", "--max-redirs", "5"]
+        else:
+            token = os.environ.get("GITEE_TOKEN", "")
+            if not token or any(c in token for c in "\r\n\0"):
+                raise MirrorError("GITEE_TOKEN 缺失或格式无效")
+            # 凭据只经标准输入传给 curl，不出现在命令行和进度日志中。
+            config = "header = " + json.dumps("Authorization: Bearer " + token) + "\n"
+            form_path = upload.resolve().as_posix().replace("\\", "\\\\").replace('"', '\\"')
+            args += ["--header", "Expect:", "--form", f'file=@"{form_path}";filename="{upload.name}"']
+        args += [url]
+        started = time.monotonic()
+        log(f"{label} 开始，大小 {size / 1_000_000:.2f} MB，总时限 {limit} 秒")
+        with tempfile.TemporaryDirectory(prefix="mirror-progress-") as temp:
+            progress_path = Path(temp) / "progress.txt"
+            progress = progress_path.open("wb")
+            try:
+                proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=progress)
+            except OSError:
+                progress.close()
+                raise MirrorError(f"{label} 无法启动 curl") from None
+            try:
+                proc.stdin.write(config.encode())
+                proc.stdin.close()
+                while True:
+                    elapsed = time.monotonic() - started
+                    try:
+                        proc.wait(timeout=min(15, max(0.1, limit + 10 - elapsed)))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() - started >= limit + 10:
+                            raise MirrorError(f"{label} 超过总时限") from None
+                        if upload is None:
+                            count = dest.stat().st_size if dest.exists() else 0
+                            log(f"{label} 已接收 {count / 1_000_000:.2f}/{size / 1_000_000:.2f} MB，耗时 {time.monotonic() - started:.0f} 秒")
+                        else:
+                            with progress_path.open("rb") as reader:
+                                reader.seek(max(0, progress_path.stat().st_size - 4096))
+                                percent = re.findall(rb"([0-9]+\.[0-9]+)%", reader.read())
+                            value = percent[-1].decode() + "%" if percent else "等待传输或服务器响应"
+                            log(f"{label} {value}，耗时 {time.monotonic() - started:.0f} 秒")
+                status = proc.stdout.read(64).decode("ascii", errors="replace").strip()
+                if proc.returncode or not re.fullmatch(r"2[0-9]{2}", status):
+                    raise MirrorError(f"{label} 失败（curl={proc.returncode}, HTTP={status[:3]}）；下次运行会回读附件后续传")
+            except OSError:
+                raise MirrorError(f"{label} 与 curl 通信失败") from None
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                with contextlib.suppress(OSError):
+                    proc.stdin.close()
+                proc.stdout.close()
+                progress.close()
+        log(f"{label} 完成，耗时 {time.monotonic() - started:.1f} 秒")
 
     def open(self, method, url, data=None, headers=None):
         if urllib.parse.urlsplit(url).scheme != "https":
@@ -123,38 +203,29 @@ class Client:
         raise MirrorError("记录数量超过安全分页上限")
 
     def download(self, url, dest, size, digest=None):
-        for attempt in range(3):
+        partial = dest.with_name(dest.name + ".part")
+        for attempt in range(2):
             try:
-                total, hasher, started = 0, hashlib.sha256(), time.monotonic()
-                with self.open("GET", url) as response, dest.open("wb") as output:
-                    while block := response.read(256 * 1024):
-                        total += len(block)
-                        if total > size or time.monotonic() - started > 300:
-                            raise MirrorError("附件超过预期大小或下载总时限")
-                        output.write(block)
-                        hasher.update(block)
-                actual = hasher.hexdigest()
-                if total != size or (digest and digest != actual):
+                self.transfer(url, partial, size)
+                with partial.open("rb") as source:
+                    actual = hashlib.file_digest(source, "sha256").hexdigest()
+                if partial.stat().st_size != size or (digest and digest != actual):
                     raise MirrorError(f"附件大小或 SHA-256 校验失败: {dest.name}")
+                partial.replace(dest)
                 return actual
-            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
-                if attempt == 2:
-                    raise MirrorError(f"附件下载失败或超时: {dest.name}") from None
+            except (MirrorError, OSError):
+                if attempt == 1:
+                    raise
+                log(f"下载 {dest.name} 未完成，准备第 {attempt + 2}/2 次尝试")
                 time.sleep(2 ** attempt)
+            finally:
+                partial.unlink(missing_ok=True)
         raise MirrorError("附件下载失败")
 
     def upload(self, url, path):
-        boundary = uuid.uuid4().hex
-        # multipart 写入临时文件并流式发送，避免完整安装包进入内存。
-        with tempfile.TemporaryFile() as body, path.open("rb") as source:
-            body.write((f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
-                        f"filename=\"{path.name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode())
-            shutil.copyfileobj(source, body, 256 * 1024)
-            body.write(f"\r\n--{boundary}--\r\n".encode())
-            length = body.tell()
-            body.seek(0)
-            self.api("POST", url, body, {"Content-Type": f"multipart/form-data; boundary={boundary}",
-                                         "Content-Length": str(length)})
+        with tempfile.TemporaryDirectory(prefix="mirror-upload-") as temp:
+            # POST 不盲目重试；响应丢失时，由调用方回读、下载校验来决定是否已成功。
+            self.transfer(url, Path(temp) / "response.json", path.stat().st_size, upload=path)
 
 
 def source_release(client, folder, download=True):
@@ -195,10 +266,11 @@ def source_release(client, folder, download=True):
     return release, assets
 
 
-def verification_receipt(expected, files):
+def verification_receipt(expected, files, partial=False):
     """记录已核验的附件身份；删除重传会改变 ID，触发下一次完整校验。"""
     selected = [a for a in files if a["name"] in expected]
-    if len(selected) != len(expected) or {a["name"] for a in selected} != set(expected):
+    names = {a["name"] for a in selected}
+    if not selected or len(names) != len(selected) or (not partial and names != set(expected)):
         return None
     state = []
     for asset in sorted(selected, key=lambda a: a["name"]):
@@ -297,15 +369,13 @@ def run(client, target, keep, budget, apply, folder):
         if re.fullmatch(TAG_PATTERN, release["tag_name"]) and version(release["tag_name"]) > version(tag):
             raise MirrorError("镜像已有更高版本，拒绝回退或清理")
     current = same[0] if same else None
-    receipt = verification_receipt(expected, current["files"]) if current else None
-    cached = (current and not current.get("prerelease") and MARKER in (current.get("body") or "")
+    receipt = verification_receipt(expected, current["files"], partial=True) if current else None
+    cached = (current and MARKER in (current.get("body") or "")
               and receipt and receipt in (current.get("body") or ""))
-    if not cached:
-        # 仅新版本或附件身份变化时传输 ZIP；常规定时轮询只读取元数据和小型校验清单。
-        for name, asset in expected.items():
-            if name != "SHA256SUMS.txt":
-                client.download(asset["browser_download_url"], folder / name, asset["size"], asset["sha256"])
-    present = set(expected) if cached else (verify_target(client, current, expected, folder) if current else set())
+    # 按附件续传，已核验的半包也可复用；不再提前下载整版 ZIP。
+    present = ({a["name"] for a in current["files"] if a["name"] in expected} if cached
+               else verify_target(client, current, expected, folder) if current else set())
+    verified = {a["name"]: dict(a) for a in current["files"] if a["name"] in present} if current else {}
     if (current and MARKER not in (current.get("body") or "")
             and (present != set(expected) or {a["name"] for a in current["files"]} != set(expected))):
         raise MirrorError("手动发行版必须完整匹配五个官方附件后才能接管")
@@ -377,13 +447,43 @@ def run(client, target, keep, budget, apply, folder):
             "target_commitish": repo["default_branch"], "prerelease": True,
         })
     attach_url = f"{base}/releases/{current['id']}/attach_files"
+
+    def checkpoint():
+        receipt = verification_receipt(expected, list(verified.values()), partial=True)
+        if verification_receipt(expected, current["files"], partial=True) != receipt:
+            raise MirrorError("附件身份在核验期间变化，停止保存进度")
+        if receipt:
+            client.api("PATCH", f"{base}/releases/{current['id']}", {
+                "tag_name": tag, "name": tag, "body": body + "\n\n" + receipt, "prerelease": True,
+            })
+            log(f"已保存 {tag} 的进度，核验完成 {len(present)}/{len(expected)} 个附件")
+
+    if current.get("prerelease") and present:
+        checkpoint()
     for name in sorted(set(expected) - present):
-        client.upload(attach_url, folder / name)
-        print(f"已上传 {name}")
+        asset = expected[name]
+        if not (folder / name).exists():
+            client.download(asset["browser_download_url"], folder / name, asset["size"], asset["sha256"])
+        try:
+            client.upload(attach_url, folder / name)
+        except MirrorError:
+            # 上传成功但响应丢失时，只回读校验，不重复 POST 产生同名附件。
+            log(f"上传 {name} 未确认，检查服务器是否已接收")
+            current["files"] = client.pages(attach_url)
+            if not any(a["name"] == name for a in current["files"]):
+                raise
+        current["files"] = client.pages(attach_url)
+        if verify_target(client, current, {name: asset}, folder) != {name}:
+            raise MirrorError(f"上传后未找到附件: {name}")
+        present.add(name)
+        verified[name] = next(dict(a) for a in current["files"] if a["name"] == name)
+        log(f"已上传并校验 {name}")
+        if present != set(expected):
+            checkpoint()
     current["files"] = client.pages(attach_url)
     fresh_receipt = verification_receipt(expected, current["files"])
-    if (not cached or fresh_receipt != receipt) and verify_target(client, current, expected, folder) != set(expected):
-        raise MirrorError("上传后附件不完整，保留预发布状态及旧版")
+    if fresh_receipt != verification_receipt(expected, list(verified.values())):
+        raise MirrorError("附件身份在发布前变化，保留预发布状态及旧版")
     if not fresh_receipt:
         raise MirrorError("上传后附件身份不完整，保留预发布状态及旧版")
     body += "\n\n" + fresh_receipt
@@ -394,13 +494,15 @@ def run(client, target, keep, budget, apply, folder):
     published = client.api("GET", f"{base}/releases/{current['id']}")
     if published.get("prerelease") or published.get("tag_name") != tag or MARKER not in (published.get("body") or ""):
         raise MirrorError("发布状态回读失败，保留旧版")
+    if verification_receipt(expected, client.pages(attach_url)) != fresh_receipt:
+        raise MirrorError("发布后附件身份发生变化，保留旧版")
     for release in cleanup:
         if release not in before:
             remove(release)
     final_total = sum(a["size"] for r in inventory(client, base) for a in r["files"])
     if final_total > budget:
         raise MirrorError("最终容量仍超过预算，请检查并发上传的非托管附件")
-    print(f"同步完成: {tag}，发行附件合计 {final_total / 1_000_000:.2f} MB")
+    log(f"同步完成: {tag}，发行附件合计 {final_total / 1_000_000:.2f} MB")
 
 
 def main():

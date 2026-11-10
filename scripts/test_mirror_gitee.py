@@ -4,12 +4,13 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import mirror_gitee as mirror
 
@@ -200,12 +201,18 @@ class MirrorTests(unittest.TestCase):
             self.run_mirror()
         self.assert_no_writes()
 
-    def test_source_rejects_download_hash_conflict_before_writes(self):
+    def test_corrupt_source_download_is_not_uploaded_and_preserves_old_stable(self):
+        old = self.client.add_release("release-2.1.8")
+        old_files = copy.deepcopy(old["files"])
         asset = self.client.source_assets[0]
         self.client.content[asset["browser_download_url"]] = b"!" * asset["size"]
         with self.assertRaises(mirror.MirrorError):
             self.run_mirror()
-        self.assert_no_writes()
+        self.assertEqual(old["files"], old_files)
+        self.assertFalse(any(e["kind"] == "upload" and e["name"] == asset["name"] for e in self.client.events))
+        self.assertFalse(any(e.get("method") == "DELETE" or
+                             (e.get("method") == "PATCH" and not e["data"]["prerelease"])
+                             for e in self.client.events))
 
     def test_manifest_rejects_missing_duplicate_unknown_and_invalid_hash(self):
         original = fixture_files("release-2.1.9")["SHA256SUMS.txt"].decode()
@@ -272,7 +279,7 @@ class MirrorTests(unittest.TestCase):
     def test_new_release_is_prerelease_until_every_uploaded_file_is_verified(self):
         self.run_mirror()
         created = next(e for e in self.client.events if e.get("method") == "POST")
-        published = next(e for e in self.client.events if e.get("method") == "PATCH")
+        published = next(e for e in self.client.events if e.get("method") == "PATCH" and not e["data"]["prerelease"])
         self.assertIs(created["data"]["prerelease"], True)
         self.assertIs(published["data"]["prerelease"], False)
         patch_index = self.client.events.index(published)
@@ -310,7 +317,8 @@ class MirrorTests(unittest.TestCase):
                 self.client.events.clear()
                 self.run_mirror()
                 downloads = {e["url"] for e in self.client.events if e["kind"] == "download"}
-                self.assertTrue({a["browser_download_url"] for a in self.client.source_assets} <= downloads)
+                self.assertEqual({a["browser_download_url"] for a in self.client.source_assets} & downloads,
+                                 {a["browser_download_url"] for a in self.client.source_assets if a["name"] == "SHA256SUMS.txt"})
                 self.assertTrue({a["browser_download_url"] for a in current["files"]} <= downloads)
                 self.assertFalse(any(e["kind"] == "upload" or e.get("method") == "DELETE"
                                      for e in self.client.events))
@@ -325,6 +333,56 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(len(current["files"]), 5)
         self.assertFalse(current["prerelease"])
 
+    def test_failed_run_resumes_from_verified_checkpoint_without_redownloading_finished_files(self):
+        self.client.fail_upload_at = 3
+        with self.assertRaises(mirror.MirrorError):
+            self.run_mirror()
+        current = self.client.releases[0]
+        retained = copy.deepcopy(current["files"])
+        self.assertEqual(len(retained), 2)
+        self.assertIn(mirror.verification_receipt(
+            {a["name"]: {**a, "sha256": hashlib.sha256(self.client.content[a["browser_download_url"]]).hexdigest()}
+             for a in self.client.source_assets}, retained, partial=True), current["body"])
+        self.client.events.clear()
+        self.client.fail_upload_at = None
+        self.run_mirror()
+        uploaded = {e["name"] for e in self.client.events if e["kind"] == "upload"}
+        self.assertEqual(uploaded, set(fixture_files("release-2.1.9")) - {a["name"] for a in retained})
+        downloads = {e["url"] for e in self.client.events if e["kind"] == "download"}
+        self.assertFalse({a["browser_download_url"] for a in retained} & downloads)
+        self.assertFalse(current["prerelease"])
+
+    def test_lost_upload_response_is_reconciled_without_duplicate_post(self):
+        original = self.client.upload
+        def lost_response(url, path):
+            original(url, path)
+            raise mirror.MirrorError("response lost after server accepted file")
+        with patch.object(self.client, "upload", side_effect=lost_response):
+            self.run_mirror()
+        self.assertEqual(self.client.upload_count, 5)
+        self.assertEqual(len(self.client.releases[0]["files"]), 5)
+        self.assertFalse(self.client.releases[0]["prerelease"])
+
+    def test_replaced_verified_file_prevents_checkpoint_and_publication(self):
+        current = self.client.add_release("release-2.1.9", prerelease=True)
+        current["files"] = current["files"][:1]
+        original = self.client.pages
+        def replaced(url):
+            if url.endswith("/attach_files") and len(current["files"]) == 2:
+                current["files"][0]["id"] += 1000
+            return original(url)
+        with patch.object(self.client, "pages", side_effect=replaced), self.assertRaises(mirror.MirrorError):
+            self.run_mirror()
+        self.assertTrue(current["prerelease"])
+        self.assertFalse(any(e.get("method") == "PATCH" and not e["data"]["prerelease"] for e in self.client.events))
+
+    def test_preview_only_downloads_manifest_when_target_has_no_files(self):
+        self.run_mirror(apply=False)
+        downloads = [e for e in self.client.events if e["kind"] == "download"]
+        self.assertEqual(len(downloads), 1)
+        self.assertTrue(downloads[0]["url"].endswith("/SHA256SUMS.txt"))
+        self.assert_no_writes()
+
     def test_upload_failure_preserves_latest_stable_and_prerelease(self):
         old = self.client.add_release("release-2.1.8")
         original_ids = {a["id"] for a in old["files"]}
@@ -332,7 +390,9 @@ class MirrorTests(unittest.TestCase):
         with self.assertRaises(mirror.MirrorError):
             self.run_mirror(keep=1)
         self.assertEqual({a["id"] for a in old["files"]}, original_ids)
-        self.assertFalse(any(e.get("method") in ("DELETE", "PATCH") for e in self.client.events))
+        self.assertFalse(any(e.get("method") == "DELETE" or
+                             (e.get("method") == "PATCH" and not e["data"]["prerelease"])
+                             for e in self.client.events))
         self.assertTrue(next(r for r in self.client.releases if r["tag_name"] == "release-2.1.9")["prerelease"])
 
     def test_missing_or_corrupt_uploaded_file_blocks_publish_and_cleanup(self):
@@ -344,7 +404,9 @@ class MirrorTests(unittest.TestCase):
                 with self.assertRaises(mirror.MirrorError):
                     self.run_mirror(keep=1)
                 self.assertEqual(len(old["files"]), 5)
-                self.assertFalse(any(e.get("method") in ("DELETE", "PATCH") for e in self.client.events))
+                self.assertFalse(any(e.get("method") == "DELETE" or
+                                     (e.get("method") == "PATCH" and not e["data"]["prerelease"])
+                                     for e in self.client.events))
 
     def test_sliding_window_keeps_three_versions_and_cleans_after_publish(self):
         old = [self.client.add_release(f"release-2.1.{v}") for v in (6, 7, 8)]
@@ -453,7 +515,8 @@ class MirrorTests(unittest.TestCase):
             self.run_mirror(budget=release_size * 2)
         self.assertEqual(oldest["files"], [])
         self.assertEqual(len(latest["files"]), 5)
-        self.assertFalse(any(e.get("method") == "PATCH" for e in self.client.events))
+        self.assertFalse(any(e.get("method") == "PATCH" and not e["data"]["prerelease"]
+                             for e in self.client.events))
 
     def test_unknown_attachments_are_not_deleted_and_count_against_budget(self):
         old = self.client.add_release("release-2.1.8", extra={"user-notes.txt": b"private fixture"})
@@ -574,42 +637,98 @@ class ClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             for size, digest in ((len(data) - 1, None), (len(data) + 1, None), (len(data), "0" * 64)):
                 with self.subTest(size=size, digest=digest), \
-                        patch.object(self.client, "open", return_value=io.BytesIO(data)), self.assertRaises(mirror.MirrorError):
+                        patch.object(self.client, "transfer", side_effect=lambda url, path, size: path.write_bytes(data)), \
+                        patch.object(mirror.time, "sleep"), self.assertRaises(mirror.MirrorError):
                     self.client.download("https://downloads.invalid/archive.zip", Path(temp) / "archive.zip", size, digest)
 
     def test_download_retry_replaces_partial_file(self):
         data = b"synthetic-archive"
-        class Interrupted(io.BytesIO):
-            def read(self, size=-1):
-                if self.tell():
-                    raise OSError("connection lost")
-                return super().read(3)
+        attempts = []
+        def interrupted(url, path, size):
+            attempts.append(path)
+            path.write_bytes(data[:3] if len(attempts) == 1 else data)
+            if len(attempts) == 1:
+                raise mirror.MirrorError("connection lost")
 
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(self.client, "open", side_effect=[Interrupted(data), io.BytesIO(data)]), \
+                patch.object(self.client, "transfer", side_effect=interrupted), \
                 patch.object(mirror.time, "sleep"):
             path = Path(temp) / "archive.zip"
             result = self.client.download("https://downloads.invalid/archive.zip", path, len(data))
             self.assertEqual(path.read_bytes(), data)
             self.assertEqual(result, hashlib.sha256(data).hexdigest())
+            self.assertEqual(len(attempts), 2)
+            self.assertFalse(path.with_name(path.name + ".part").exists())
 
     def test_upload_passes_stream_and_matching_content_length(self):
-        observed = {}
-        def capture(method, url, data, headers):
-            self.assertEqual(method, "POST")
+        def capture(url, dest, size, upload):
             self.assertEqual(url, BASE + "/releases/1/attach_files")
-            self.assertFalse(isinstance(data, (bytes, bytearray)))
-            observed["body"] = data.read()
-            observed["headers"] = headers
+            self.assertEqual(upload.read_bytes(), b"fixture archive content")
+            self.assertEqual(size, upload.stat().st_size)
+            self.assertEqual(dest.name, "response.json")
 
-        with tempfile.TemporaryDirectory() as temp, patch.object(self.client, "api", side_effect=capture):
+        with tempfile.TemporaryDirectory() as temp, patch.object(self.client, "transfer", side_effect=capture) as transfer:
             path = Path(temp) / "archive.zip"
             path.write_bytes(b"fixture archive content")
             self.client.upload(BASE + "/releases/1/attach_files", path)
-        self.assertEqual(int(observed["headers"]["Content-Length"]), len(observed["body"]))
-        self.assertIn(b'filename="archive.zip"', observed["body"])
-        self.assertIn(b"fixture archive content", observed["body"])
-        self.assertIn("multipart/form-data; boundary=", observed["headers"]["Content-Type"])
+        transfer.assert_called_once()
+
+    def test_curl_uses_streamed_form_total_timeout_and_stdin_credentials(self):
+        secret = "synthetic-gitee-secret"
+        process = Mock(returncode=0)
+        process.poll.return_value = 0
+        process.stdout.read.return_value = b"201"
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"GITEE_TOKEN": secret}), \
+                patch.object(mirror.shutil, "which", return_value="curl"), \
+                patch.object(mirror.subprocess, "Popen", return_value=process) as popen, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            path = Path(temp) / "archive.zip"
+            path.write_bytes(b"fixture")
+            self.client.upload(BASE + "/releases/1/attach_files", path)
+        args = popen.call_args.args[0]
+        self.assertEqual(args[0:2], ["curl", "--disable"])
+        self.assertEqual(args[args.index("--max-time") + 1], "900")
+        self.assertEqual(args[args.index("--proto") + 1], "=https")
+        self.assertIn("--form", args)
+        self.assertNotIn("--location", args)
+        self.assertNotIn(secret, str(args) + output.getvalue())
+        self.assertIn(secret.encode(), process.stdin.write.call_args.args[0])
+        process.stdin.close.assert_called()
+
+    def test_curl_deadline_and_cancellation_kill_and_reap_child(self):
+        for exception in (subprocess.TimeoutExpired("curl", 15), KeyboardInterrupt()):
+            with self.subTest(exception=type(exception).__name__):
+                process = Mock(returncode=None)
+                process.poll.return_value = None
+                process.wait.side_effect = [exception, None]
+                with tempfile.TemporaryDirectory() as temp, patch.object(mirror.shutil, "which", return_value="curl"), \
+                        patch.object(mirror.subprocess, "Popen", return_value=process), \
+                        patch.object(mirror.time, "monotonic", side_effect=[0, 0, 1000]), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        self.assertRaises(mirror.MirrorError if isinstance(exception, subprocess.TimeoutExpired) else KeyboardInterrupt):
+                    self.client.transfer("https://downloads.invalid/a.zip", Path(temp) / "a.zip", 10)
+                process.kill.assert_called_once()
+                self.assertEqual(process.wait.call_count, 2)
+
+    def test_curl_rejects_http_and_foreign_upload_before_start(self):
+        for url, upload in (("http://downloads.invalid/a", None),
+                            ("https://user:password@gitee.com/a", None),
+                            ("https://foreign.invalid/a", Path("archive.zip"))):
+            with self.subTest(url=url), patch.object(mirror.subprocess, "Popen") as popen, \
+                    self.assertRaises(mirror.MirrorError):
+                self.client.transfer(url, Path("result"), 1, upload=upload)
+            popen.assert_not_called()
+
+    def test_failed_download_preserves_old_destination_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(mirror.time, "sleep"):
+            path = Path(temp) / "archive.zip"
+            path.write_bytes(b"old verified content")
+            def truncated(url, partial, size):
+                partial.write_bytes(b"bad")
+            with patch.object(self.client, "transfer", side_effect=truncated), self.assertRaises(mirror.MirrorError):
+                self.client.download("https://downloads.invalid/a", path, 7)
+            self.assertEqual(path.read_bytes(), b"old verified content")
+            self.assertFalse(path.with_name(path.name + ".part").exists())
 
     def test_credential_redirects_and_https_downgrades_are_blocked(self):
         redirect = mirror.SafeRedirect()
