@@ -51,7 +51,8 @@ jobs:
       vars.GITEE_REPOSITORY != '' &&
       ((github.event_name == 'workflow_dispatch' && inputs.dry_run) ||
        vars.GITEE_MIRROR_ENABLED == 'true')
-    runs-on: macos-latest
+    # 实测到 Gitee 的上传比 Ubuntu/macOS 更快；速度仍受跨境网络影响。
+    runs-on: windows-latest
     # 每个传输有独立时限；为慢速跨境上传和逐文件回读校验留出总时间。
     timeout-minutes: 180
     concurrency:
