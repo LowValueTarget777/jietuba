@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -635,6 +636,32 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn("secret-token", str(caught.exception))
                 self.assertEqual(opened.call_count, 1)
                 sleep.assert_not_called()
+
+    def test_api_retries_writes_only_when_dns_failed_before_sending(self):
+        for method in ("POST", "PATCH", "DELETE"):
+            for wrapped in (False, True):
+                error = socket.gaierror(-2, "synthetic-sensitive-detail")
+                if wrapped:
+                    error = urllib.error.URLError(error)
+                with self.subTest(method=method, wrapped=wrapped), \
+                        patch.object(self.client, "open", side_effect=[error, io.BytesIO(b'{"ok":true}')]) as opened, \
+                        patch.object(mirror.time, "sleep") as sleep:
+                    self.assertEqual(self.client.api(method, BASE), {"ok": True})
+                    self.assertEqual(opened.call_count, 2)
+                    sleep.assert_called_once_with(5)
+
+    def test_api_dns_retries_are_bounded_and_sanitize_error_details(self):
+        for method in ("GET", "POST", "PATCH", "DELETE"):
+            with self.subTest(method=method), \
+                    patch.object(self.client, "open", side_effect=urllib.error.URLError(
+                        socket.gaierror(-2, "synthetic-sensitive-detail"))) as opened, \
+                    patch.object(mirror.time, "sleep") as sleep, \
+                    self.assertRaises(mirror.MirrorError) as caught:
+                self.client.api(method, BASE)
+            self.assertEqual(opened.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 10])
+            self.assertIn("gaierror", str(caught.exception))
+            self.assertNotIn("synthetic-sensitive-detail", str(caught.exception))
 
     def test_http_failure_does_not_expose_token_or_response_body(self):
         secret = "synthetic-sensitive-token"

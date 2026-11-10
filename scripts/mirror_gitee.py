@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -167,8 +168,8 @@ class Client:
         if isinstance(data, dict):
             data = json.dumps(data).encode()
             headers["Content-Type"] = "application/json"
-        # 写操作不盲目重试；若响应丢失，下一轮通过回读决定是否续传。
-        for attempt in range(3 if method == "GET" else 1):
+        # DNS 失败时请求尚未发出，可安全重试；其他写入错误由调用方回读确认。
+        for attempt in range(3):
             try:
                 with self.open(method, url, data, headers) as response:
                     body = response.read(JSON_LIMIT + 1)
@@ -182,8 +183,9 @@ class Client:
                 # 不输出响应正文或完整 URL，避免服务端错误包含令牌。
                 raise MirrorError(f"{host}: {method} HTTP {exc.code}") from None
             except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
-                if method == "GET" and attempt < 2:
-                    time.sleep(2 ** attempt)
+                dns_failed = isinstance(getattr(exc, "reason", exc), socket.gaierror)
+                if (method == "GET" or dns_failed) and attempt < 2:
+                    time.sleep((5 if dns_failed else 1) * 2 ** attempt)
                     continue
                 reason = type(getattr(exc, "reason", exc)).__name__
                 raise MirrorError(f"{host}: {method} 网络请求失败或超时（{reason}）") from None
