@@ -85,7 +85,8 @@ class Client:
         curl = shutil.which("curl.exe" if os.name == "nt" else "curl")
         if not curl:
             raise MirrorError("未找到 curl，请安装后重试")
-        limit = 900 if upload is not None else 300
+        # 实测跨境上传约 20 KB/s；按更保守的 16 KB/s 给大包预算，仍有明确总时限。
+        limit = max(900, (size + 15_999) // 16_000 + 120) if upload is not None else 300
         label = ("上传 " + upload.name) if upload is not None else ("下载 " + dest.name)
         args = [curl, "--disable", "--proto", "=https", "--proto-redir", "=https",
                 "--connect-timeout", "15", "--max-time", str(limit),
@@ -103,7 +104,7 @@ class Client:
             # 凭据只经标准输入传给 curl，不出现在命令行和进度日志中。
             config = "header = " + json.dumps("Authorization: Bearer " + token) + "\n"
             form_path = upload.resolve().as_posix().replace("\\", "\\\\").replace('"', '\\"')
-            args += ["--header", "Expect:", "--form", f'file=@"{form_path}";filename="{upload.name}"']
+            args += ["--http1.1", "--header", "Expect:", "--form", f'file=@"{form_path}";filename="{upload.name}"']
         args += [url]
         started = time.monotonic()
         log(f"{label} 开始，大小 {size / 1_000_000:.2f} MB，总时限 {limit} 秒")

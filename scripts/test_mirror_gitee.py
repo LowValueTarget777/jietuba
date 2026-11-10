@@ -690,10 +690,28 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(args[args.index("--max-time") + 1], "900")
         self.assertEqual(args[args.index("--proto") + 1], "=https")
         self.assertIn("--form", args)
+        self.assertIn("--http1.1", args)
         self.assertNotIn("--location", args)
         self.assertNotIn(secret, str(args) + output.getvalue())
         self.assertIn(secret.encode(), process.stdin.write.call_args.args[0])
         process.stdin.close.assert_called()
+
+    def test_upload_deadline_allows_largest_supported_package_on_slow_link(self):
+        process = Mock(returncode=0)
+        process.poll.return_value = 0
+        process.stdout.read.return_value = b"201"
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"GITEE_TOKEN": "synthetic-secret"}), \
+                patch.object(mirror.shutil, "which", return_value="curl"), \
+                patch.object(mirror.subprocess, "Popen", return_value=process) as popen, \
+                contextlib.redirect_stdout(io.StringIO()):
+            path = Path(temp) / "archive.zip"
+            with path.open("wb") as output:
+                output.truncate(mirror.FILE_LIMIT)
+            self.client.upload(BASE + "/releases/1/attach_files", path)
+        args = popen.call_args.args[0]
+        deadline = int(args[args.index("--max-time") + 1])
+        self.assertGreater(deadline, mirror.FILE_LIMIT // 16_000)
+        self.assertLessEqual(deadline, 7200)
 
     def test_curl_deadline_and_cancellation_kill_and_reap_child(self):
         for exception in (subprocess.TimeoutExpired("curl", 15), KeyboardInterrupt()):
