@@ -363,6 +363,34 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(len(self.client.releases[0]["files"]), 5)
         self.assertFalse(self.client.releases[0]["prerelease"])
 
+    def test_publication_read_failure_preserves_full_checkpoint_and_old_release(self):
+        old = self.client.add_release("release-2.1.8")
+        original_ids = {a["id"] for a in old["files"]}
+        expected = {a["name"]: {**a, "sha256": hashlib.sha256(
+            self.client.content[a["browser_download_url"]]).hexdigest()} for a in self.client.source_assets}
+        original = self.client.pages
+        def interrupted(url):
+            for release in self.client.releases:
+                receipt = mirror.verification_receipt(expected, release["files"])
+                if (release["tag_name"] == self.client.source["tag_name"] and receipt
+                        and receipt in release["body"]
+                        and url == f"{BASE}/releases/{release['id']}/attach_files"):
+                    raise mirror.MirrorError("模拟发布前 API 回读失败")
+            return original(url)
+        with patch.object(self.client, "pages", side_effect=interrupted), self.assertRaises(mirror.MirrorError):
+            self.run_mirror(keep=1)
+        current = self.client.releases[-1]
+        self.assertTrue(current["prerelease"])
+        self.assertIn(mirror.verification_receipt(expected, current["files"]), current["body"])
+        self.assertEqual({a["id"] for a in old["files"]}, original_ids)
+        self.client.events.clear()
+        self.run_mirror(keep=1)
+        self.assertFalse(current["prerelease"])
+        self.assertFalse(any(e["kind"] == "upload" for e in self.client.events))
+        downloads = [e for e in self.client.events if e["kind"] == "download"]
+        self.assertEqual(len(downloads), 1)
+        self.assertTrue(downloads[0]["url"].endswith("/SHA256SUMS.txt"))
+
     def test_replaced_verified_file_prevents_checkpoint_and_publication(self):
         current = self.client.add_release("release-2.1.9", prerelease=True)
         current["files"] = current["files"][:1]

@@ -181,11 +181,12 @@ class Client:
                     continue
                 # 不输出响应正文或完整 URL，避免服务端错误包含令牌。
                 raise MirrorError(f"{host}: {method} HTTP {exc.code}") from None
-            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
                 if method == "GET" and attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
-                raise MirrorError(f"{host}: {method} 网络请求失败或超时") from None
+                reason = type(getattr(exc, "reason", exc)).__name__
+                raise MirrorError(f"{host}: {method} 网络请求失败或超时（{reason}）") from None
         raise MirrorError("API 请求失败")
 
     def pages(self, url):
@@ -479,8 +480,9 @@ def run(client, target, keep, budget, apply, folder):
         present.add(name)
         verified[name] = next(dict(a) for a in current["files"] if a["name"] == name)
         log(f"已上传并校验 {name}")
-        if present != set(expected):
-            checkpoint()
+        # 最后一份也先保存，发布前的 API 波动不应丢失整版的核验进度。
+        checkpoint()
+    log("全部附件已核验，回读发布前状态")
     current["files"] = client.pages(attach_url)
     fresh_receipt = verification_receipt(expected, current["files"])
     if fresh_receipt != verification_receipt(expected, list(verified.values())):
@@ -497,6 +499,7 @@ def run(client, target, keep, budget, apply, folder):
         raise MirrorError("发布状态回读失败，保留旧版")
     if verification_receipt(expected, client.pages(attach_url)) != fresh_receipt:
         raise MirrorError("发布后附件身份发生变化，保留旧版")
+    log("镜像发布状态已确认，开始清理窗口外旧附件")
     for release in cleanup:
         if release not in before:
             remove(release)
