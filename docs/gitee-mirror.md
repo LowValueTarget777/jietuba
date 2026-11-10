@@ -38,7 +38,7 @@
 
 ## 本地预演与测试
 
-使用 Python 3.11 或更新版本，并在 PATH 中提供 curl，在仓库根目录执行。同步使用 GitHub 的 Windows runner，使用系统自带的 curl；测试仍在 Ubuntu 运行。读取令牌的环境变量为 `GITEE_TOKEN` 和可选的 `GH_TOKEN`；本地自行安全配置，不把令牌作为参数传给脚本。上传时令牌经 curl 的标准输入传递，进程命令行、进度和错误日志只记录文件名及状态码。
+使用 Python 3.11 或更新版本，并在 PATH 中提供 curl，在仓库根目录执行。同步使用 GitHub 的 macOS runner，使用系统自带的 curl；测试仍在 Ubuntu 运行。读取令牌的环境变量为 `GITEE_TOKEN` 和可选的 `GH_TOKEN`；本地自行安全配置，不把令牌作为参数传给脚本。上传时令牌经 curl 的标准输入传递，进程命令行、进度和错误日志只记录文件名及状态码。
 
 ```powershell
 # 默认只读：查看计划，不上传、不删除。
