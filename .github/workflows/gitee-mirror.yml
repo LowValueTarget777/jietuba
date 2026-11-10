@@ -2,7 +2,7 @@ name: Gitee release mirror
 
 on:
   schedule:
-    - cron: "43 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
