@@ -104,7 +104,7 @@ class Client:
             # 凭据只经标准输入传给 curl，不出现在命令行和进度日志中。
             config = "header = " + json.dumps("Authorization: Bearer " + token) + "\n"
             form_path = upload.resolve().as_posix().replace("\\", "\\\\").replace('"', '\\"')
-            args += ["--http1.1", "--header", "Expect:", "--form", f'file=@"{form_path}";filename="{upload.name}"']
+            args += ["--header", "Expect:", "--form", f'file=@"{form_path}";filename="{upload.name}"']
         args += [url]
         started = time.monotonic()
         log(f"{label} 开始，大小 {size / 1_000_000:.2f} MB，总时限 {limit} 秒")

@@ -690,7 +690,6 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(args[args.index("--max-time") + 1], "900")
         self.assertEqual(args[args.index("--proto") + 1], "=https")
         self.assertIn("--form", args)
-        self.assertIn("--http1.1", args)
         self.assertNotIn("--location", args)
         self.assertNotIn(secret, str(args) + output.getvalue())
         self.assertIn(secret.encode(), process.stdin.write.call_args.args[0])

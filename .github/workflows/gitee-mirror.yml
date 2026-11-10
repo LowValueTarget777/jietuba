@@ -51,7 +51,7 @@ jobs:
       vars.GITEE_REPOSITORY != '' &&
       ((github.event_name == 'workflow_dispatch' && inputs.dry_run) ||
        vars.GITEE_MIRROR_ENABLED == 'true')
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     # 每个传输有独立时限；为慢速跨境上传和逐文件回读校验留出总时间。
     timeout-minutes: 180
     concurrency:
@@ -70,6 +70,7 @@ jobs:
 
       - name: Mirror the latest stable release
         env:
+          PYTHONUTF8: "1"
           PYTHONUNBUFFERED: "1"
           GH_TOKEN: ${{ github.token }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
