@@ -1,6 +1,6 @@
 # Gitee 发行包镜像
 
-此镜像在自己的 GitHub fork 中运行，固定读取 [1003129155/jietuba 的最新稳定 Release](https://github.com/1003129155/jietuba/releases/latest)，复制到 [lowvaluetarget/jietuba 的 Gitee 发行版](https://gitee.com/lowvaluetarget/jietuba/releases)。fork 不会因上游发布 Release 而收到本仓库的 `release` 事件，因此使用每小时第 17 分钟的定时检查；GitHub 的定时任务可能延迟，并非实时同步。
+此镜像在自己的 GitHub fork 中运行，固定读取 [1003129155/jietuba 的最新稳定 Release](https://github.com/1003129155/jietuba/releases/latest)，复制到 [lowvaluetarget/jietuba 的 Gitee 发行版](https://gitee.com/lowvaluetarget/jietuba/releases)。fork 不会因上游发布 Release 而收到本仓库的 `release` 事件，因此使用每小时第 43 分钟的定时检查；GitHub 的定时任务可能延迟，并非实时同步。
 
 只复制同一正式版本的四个原始 ZIP（完整版、轻量版各含 x64 与 ARM64）和 `SHA256SUMS.txt`，下载后核对 SHA256；默认不回填旧版历史。不会重新构建、重打包、重新签名或修改程序内下载源；原有 C++ 应用、共享 Rust 和归档 Python 实现均无改动。GitHub 保留完整发行历史。
 
